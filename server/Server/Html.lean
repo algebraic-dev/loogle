@@ -55,6 +55,11 @@ scoped syntax (name := attrNamed) ident " = " str : attrib
 scoped syntax (name := attrTerm) ident " = " "{{" term "}}" : attrib
 scoped syntax (name := attrBool) ident : attrib
 
+scoped syntax (name := attrNamedStr) str " = " str : attrib
+scoped syntax (name := attrTermStr) str " = " "{{" term "}}" : attrib
+scoped syntax (name := attrBoolStr) str : attrib
+
+
 def _root_.Lean.TSyntax.tagName : TSyntax `tag_name → String
   | ⟨.node _ _ #[.atom _ x]⟩ => x
   | ⟨.node _ _ #[.ident _ _ x ..]⟩ => x.eraseMacroScopes.toString
@@ -80,6 +85,12 @@ def elabAttrs (stxs : Array (TSyntax `attrib)) : TermElabM Expr := do
       attrs ← mkAppM ``Array.push #[attrs, ← mkAppM ``Prod.mk #[toExpr name.getId.toString, ← elabTermEnsuringType val (some (.const ``String []))]]
     | `(attrib| $name:ident) =>
       attrs ← mkAppM ``Array.push #[attrs, ← mkAppM ``Prod.mk #[toExpr name.getId.toString, toExpr ""]]
+    | `(attrib| $name:str = $val:str) =>
+      attrs ← mkAppM ``Array.push #[attrs, ← mkAppM ``Prod.mk #[toExpr name.getString, toExpr val.getString]]
+    | `(attrib| $name:str = {{ $val:term }}) =>
+      attrs ← mkAppM ``Array.push #[attrs, ← mkAppM ``Prod.mk #[toExpr name.getString, ← elabTermEnsuringType val (some (.const ``String []))]]
+    | `(attrib| $name:str) =>
+      attrs ← mkAppM ``Array.push #[attrs, ← mkAppM ``Prod.mk #[toExpr name.getString, toExpr ""]]
     | _ => withRef stx throwUnsupportedSyntax
   return attrs
 
@@ -120,23 +131,40 @@ elab_rules : term
 /-- Converts HTML into a readable string -/
 partial def Html.asString (html : Html) (indent : Nat := 0) (breakLines := true) : String :=
   match html with
-  | .text true str => str.replace "<" "&lt;" |>.replace ">" "&gt;"
-  | .text false str => str
+  | .text true str =>
+    str.trimAscii.replace "<" "&lt;" |>.replace ">" "&gt;"
+  | .text false str =>
+    str.trimAscii.toString
   | .tag name attrs (.seq #[]) =>
     if name ∈ mustClose then
       "<" ++ name ++ attrsAsString attrs ++ "></" ++ name ++ ">" ++ breakline name
     else
       "<" ++ name ++ attrsAsString attrs ++ ">" ++ breakline name
   | .tag name attrs body =>
-    "<" ++ name ++ attrsAsString attrs ++ ">" ++ breakline' name ++
-    Html.asString body (indent := indent + 2) (breakLines := breakLines) ++
+    let bodyStr := Html.asString body (indent := indent + 2) (breakLines := breakLines)
+    let needsNewline := breakLines && name ∈ newlineAfter && !isInlineContent body
+    "<" ++ name ++ attrsAsString attrs ++ ">" ++
+    (if needsNewline then newline (indent + 2) else "") ++
+    bodyStr ++
+    (if needsNewline then newline indent else "") ++
     s!"</{name}>" ++ breakline name
-  | .seq elts => String.join (elts.toList.map (Html.asString · (indent := indent) (breakLines := breakLines)))
+  | .seq elts =>
+    String.join (elts.toList.map (Html.asString · (indent := indent) (breakLines := breakLines)))
 where
   newline i := "\n" ++ String.ofList (List.replicate i ' ')
   breakline tag := if breakLines && tag ∈ newlineAfter then newline indent else ""
-  breakline' tag := if breakLines && tag ∈ newlineAfter then newline (indent + 2) else ""
-  attrsAsString xs := String.join <| xs.toList.map (fun ⟨k, v⟩ => s!" {k}=\"{v}\"")
+
+  -- Check if content is inline (just text, no nested tags)
+  isInlineContent : Html → Bool
+    | .text _ _ => true
+    | .seq #[] => true
+    | .seq #[.text _ _] => true
+    | _ => false
+
+  attrsAsString xs := String.join <| xs.toList.map (fun ⟨k, v⟩ =>
+    let k := if k == "className" then "class" else k
+    s!" {k}=\"{escapeAttr v}\"")
+
   escapeAttr (str : String) := str |>.replace "&" "&amp;" |>.replace "\"" "&quot;"
 
 instance : Coe String Html where

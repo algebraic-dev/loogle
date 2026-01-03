@@ -9,6 +9,14 @@ open Lean
 /--
 Represents a single search result hit containing declaration information
 -/
+structure Loogle.Error where
+  error: String
+  heartbeats: Nat := 0
+deriving ToJson, FromJson, Repr, Inhabited
+
+/--
+Represents a single search result hit containing declaration information
+-/
 structure Hit where
   name: String
   type: String
@@ -50,6 +58,8 @@ inductive BackendFailureReason
   | processExited (exitCode: UInt32)
   | sandboxEscapeAttempt
   | noResponse
+  | errorDecoding
+  | other (s : String)
 
 instance : ToString BackendFailureReason where
   toString
@@ -57,13 +67,15 @@ instance : ToString BackendFailureReason where
     | .processExited exitCode => s!"Backend process exited with code {exitCode}"
     | .sandboxEscapeAttempt => "Backend attempted to escape the sandbox"
     | .noResponse => "No response received from backend"
+    | .errorDecoding => "Error decoding"
+    | .other s => s
 
 /--
 Configuration for spawning the Loogle backend process
 -/
 def backendConfig : Process.SpawnArgs := {
   cmd := ".lake/build/bin/loogle",
-  args := #["--json", "--interactive", "--module", "Std"],
+  args := #["--json", "--interactive", "--module", "Init.Data"],
   stdin := .piped,
   stdout := .piped
 }
@@ -122,13 +134,24 @@ def executeQuery (db : Database) (query : String) : IO (Except BackendFailureRea
     return .error .noGreeting
   else
     try
+      dbg_trace "[database] query send {query ++ "\n" |>.quote}"
       dbState.child.stdin.write (String.toUTF8 $ query ++ "\n")
       dbState.child.stdin.flush
+      dbg_trace "[database] get line"
       let outputJson ← dbState.child.stdout.getLine
-      match Lean.Json.parse outputJson >>= FromJson.fromJson? with
-      | Except.ok output => return .ok output
-      | Except.error e => throw <| IO.userError s!"JSON decode error: {e}"
-    catch _ =>
+      dbg_trace "[database] parse"
+      match Lean.Json.parse outputJson with
+      | Except.ok output =>
+        match FromJson.fromJson? output with
+        | .ok (res : SearchResult) => pure (.ok res)
+        | .error _err =>
+          match FromJson.fromJson? output with
+          | .ok (res : Loogle.Error) => pure (.error (.other res.error))
+          | .error _err => pure (.error .errorDecoding)
+
+      | Except.error e => throw <| IO.userError s!"{e} // { outputJson }"
+    catch e =>
+      dbg_trace "[database] error {e}"
       -- Allow the process to terminate
       IO.sleep 5000
       let exitCode ← dbState.child.wait
@@ -175,10 +198,13 @@ Execute a query with metrics tracking
 def query (db : Database) (queryString : String) : LoogleM (Except BackendFailureReason SearchResult) := do
   let context : Context ← MonadReader.read
   context.metrics.increment "queries"
+
+  dbg_trace "[server] query '{queryString}'"
   let output ← executeQuery db queryString
 
   match output with
   | .ok data => do
+    dbg_trace "[server] got '{data.count}' results for '{queryString}'"
     context.metrics.addValue "results" data.count
     context.metrics.addValue "heartbeats" data.heartbeats
     return .ok data
@@ -307,6 +333,8 @@ def hitComponent (hit: Hit) : Html :=
       </a>
       {{" "}}
       <small>
+        <span className="copy" title="Copy to clipboard" "data-text"={{hit.name}}>"📋"</span>
+        {{" "}}
         {{hit.module}}
       </small>
       <br />
@@ -340,24 +368,50 @@ def suggestionsComponent (suggestions: Array String) : Html :=
   }}
 
 /--
+Blurb/documentation component
+-/
+def blurbComponent (html : String) (loogleRev mathlibRev: String) : Html :=
+  {{
+    <p>
+     {{ html }}
+      <small>
+        "This is Loogle revision "
+        <a href={{s!"https://github.com/nomeata/loogle/commit/{loogleRev}"}}>
+          <code>{{loogleRev.take 7 |> toString}}</code>
+        </a>
+        " serving mathlib revision "
+        <a href={{s!"https://github.com/leanprover-community/mathlib4/commit/{mathlibRev}"}}>
+          <code>{{mathlibRev.take 7 |> toString}}</code>
+        </a>
+      </small>
+    </p>
+  }}
+
+/--
 Main HTTP request handler that routes requests to appropriate endpoints
 -/
-def handleRequest (request : Request Body) : LoogleM (Response Body) := do
+def handleRequest (request : Request Body) (loogleRev mathlibRev : String) : LoogleM (Response Body) := do
   let context ← read
 
   match (request.head.method, toString request.head.uri.path) with
   | (.get, "/") => do
-    let query := request.head.uri.query.find? "q" |>.getD ""
+    let query :=  URI.decodeFormComponent (request.head.uri.query.find? "q" |>.getD "") |>.toOption |>.getD ""
     let isLucky := request.head.uri.query.find? "lucky" |>.isSome
 
     trackClient context request.head.headers false
 
     let result : Except BackendFailureReason SearchResult ← do
-      if query.isEmpty then
-        pure (Except.ok (SearchResult.mk none 0 none "" 0 #[]))
-      else
-        let normalizedQuery := query.replace " " " "
-        context.database.query normalizedQuery
+      match URI.decodeFormComponent query with
+      | .error _ =>
+        pure (Except.error BackendFailureReason.errorDecoding)
+      | .ok queryString =>
+        let queryString := queryString.trimAscii.toString
+
+        if query.isEmpty then
+          pure (Except.ok (SearchResult.mk none 0 none "" 0 #[]))
+        else
+          let queryString := queryString.trimAscii.toString
+          context.database.query queryString
 
     -- Handle "I'm Feeling Lucky" redirect
     if isLucky then
@@ -409,44 +463,48 @@ def handleRequest (request : Request Body) : LoogleM (Response Body) := do
           <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
-                <link rel="stylesheet"
-                      href="https://unpkg.com/chota@0.9.2/dist/chota.min.css"
-                      integrity="sha384-A2UBIkgVTcNWgv+snhw7PKvU/L9N0JqHwgwDwyNcbsLiVhGG5KAuR64N4wuDYd99"
-                      crossorigin="anonymous" />
-                <link
-                    rel="modulepreload"
-                    href="https://cdn.skypack.dev/pin/@leanprover/unicode-input-component@v0.1.4-26sLE5METYYO2xtxbFPA/optimized/@leanprover/unicode-input-component.js"
-                    crossorigin="anonymous"
-                  />
-
-                <link rel="modulepreload"
-                      href="https://cdn.skypack.dev/pin/@leanprover/unicode-input-component@v0.1.4-26sLE5METYYO2xtxbFPA/mode=raw,min/optimized/@leanprover/unicode-input-component.js"
-                      integrity="sha384-IA8mae633t0WQFKjWyfKqeVMEsBqJX0L9+qTk7wAslS+h6NI5CkEX7rYNjV7Etmo"
-                      crossorigin="anonymous"/>
+            <link rel="stylesheet"
+                  href="https://unpkg.com/chota@0.9.2/dist/chota.min.css"
+                  integrity="sha384-A2UBIkgVTcNWgv+snhw7PKvU/L9N0JqHwgwDwyNcbsLiVhGG5KAuR64N4wuDYd99"
+                  crossorigin="anonymous" />
+            <link rel="modulepreload"
+                  href="https://cdn.skypack.dev/-/@leanprover/unicode-input@v0.1.4-AeWIvwNlZ6hAT63evXW0/dist=es2020,mode=imports,min/optimized/@leanprover/unicode-input.js"
+                  integrity="sha384-ApNDvGPRJLDDD+BmP75ljbblIzl8AEA4PYu8ARN1AB51WETDOje3E2Wm5mizWgo3"
+                  crossorigin="anonymous" />
+            <link rel="modulepreload"
+                  href="https://cdn.skypack.dev/pin/@leanprover/unicode-input-component@v0.1.4-26sLE5METYYO2xtxbFPA/mode=raw,min/optimized/@leanprover/unicode-input-component.js"
+                  integrity="sha384-IA8mae633t0WQFKjWyfKqeVMEsBqJX0L9+qTk7wAslS+h6NI5CkEX7rYNjV7Etmo"
+                  crossorigin="anonymous" />
             <style>
               {{
-                "@import url('https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.051/juliamono.css');
-                :root {
-                  --font-family-mono: 'JuliaMono', monospace;
-                }
-                .textinput { white-space: -moz-pre-space; }
-                .textinput {
-                  font-family: inherit;
-                  padding: 0.8rem 1rem;
-                  border-radius: 4px;
-                  border: 1px solid var(--color-lightGrey);
-                  font-size: 1em;
-                  -webkit-transition: all 0.2s ease;
-                  transition: all 0.2s ease;
-                  display: block;
-                  width: 100%;
-                }
-                .textinput:focus {
-                  outline: none;
-                  border-color: var(--color-primary);
-                  box-shadow: 0 0 1px var(--color-primary);
-                }
-                span.copy { cursor: pointer; }"
+                " @import url('https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.051/juliamono.css');
+                  :root {
+                    --font-family-mono: 'JuliaMono', monospace;
+                  }
+
+                  /* Browser fix for unicode editing */
+                  .textinput { white-space: -moz-pre-space; }
+
+                  /* Copied from chota for textinput */
+                  .textinput {
+                      font-family: inherit;
+                      padding: 0.8rem 1rem;
+                      border-radius: 4px;
+                      border: 1px solid var(--color-lightGrey);
+                      font-size: 1em;
+                      -webkit-transition: all 0.2s ease;
+                      transition: all 0.2s ease;
+                      display: block;
+                      width: 100%;
+                    }
+                   .textinput:focus {
+                      outline: none;
+                      border-color: var(--color-primary);
+                      box-shadow: 0 0 1px var(--color-primary);
+                    }
+
+                    /* Copy buttons */
+                    span.copy { cursor: pointer; }"
               }}
             </style>
             <link rel="icon" type="image/png" href="loogle.png" />
@@ -454,6 +512,7 @@ def handleRequest (request : Request Body) : LoogleM (Response Body) := do
             <meta name="twitter:title" content="Loogle - Search Lean and Mathlib" />
             <meta name="twitter:description" content="Loogle is a search tool for finding definitions, theorems, and lemmas in Lean 4 and Mathlib." />
             <meta name="twitter:image" content="https://loogle.lean-lang.org/loogle-banner.png" />
+
             <meta property="og:title" content="Loogle - Search Lean and Mathlib" />
             <meta property="og:description" content="Loogle is a search tool for finding definitions, theorems, and lemmas in Lean 4 and Mathlib." />
             <meta property="og:image" content="https://loogle.lean-lang.org/loogle-banner.png" />
@@ -467,7 +526,7 @@ def handleRequest (request : Request Body) : LoogleM (Response Body) := do
                 <form method="GET" id="queryform">
                   <div className="grouped">
                     <input id="hiddenquery" type="hidden" name="q" value=""/>
-                    <div className="textinput" id="query" name="q" contenteditable="true" autofocus="true" autocorrect="false">{{query}}</div>
+                    <div className="textinput" id="query" name="q" contenteditable="true" autofocus="true" autocorrect="false">{{.text true query.trimAscii.toString}}</div>
                     <button type="submit" id="submit">"#find"</button>
                     <button type="submit" name="lucky" value="yes" title="Directly jump to the documentation of the first hit.">"#lucky"</button>
                   </div>
@@ -477,18 +536,17 @@ def handleRequest (request : Request Body) : LoogleM (Response Body) := do
               {{ headerSection }}
               {{ hitsSection }}
               {{ suggestionsSection }}
-              <p><small>"This is Loogle serving Lean and Mathlib"</small></p>
+              {{ blurbComponent ((← context.getAsset "blurb.html") |> String.fromUTF8!) loogleRev mathlibRev }}
             </main>
             <script type="module">
               {{
-                .text false "import \"@leanprover/unicode-input-component\";
-                import { InputAbbreviationRewriter } from \"https://cdn.skypack.dev/pin/@leanprover/unicode-input-component@v0.1.0-cAcOWoqAnOWevp4vHscs/mode=imports,min/optimized/@leanprover/unicode-input-component.js\";
+                "import { InputAbbreviationRewriter } from \"https://cdn.skypack.dev/pin/@leanprover/unicode-input-component@v0.1.0-cAcOWoqAnOWevp4vHscs/mode=imports,min/optimized/@leanprover/unicode-input-component.js\";
                 const queryInput = document.getElementById('query');
                 const hiddenInput = document.getElementById('hiddenquery');
                 const form = document.getElementById('queryform');
                 const submitButton = document.getElementById('submit');
                 const rewriter = new InputAbbreviationRewriter(
-                  { abbreviationCharacter: \"\\\\\\\\\",
+                  { abbreviationCharacter: \"\\\\\",
                     customTranslations: [],
                     eagerReplacementEnabled: true },
                   queryInput,
@@ -513,12 +571,8 @@ def handleRequest (request : Request Body) : LoogleM (Response Body) := do
         </html>
       }}
 
-    dbg_trace "sending"
     return Response.ok
       |>.header! "Content-type" "text/html"
-      |>.header! "Access-Control-Allow-Origin" "*"
-      |>.header! "Access-Control-Allow-Methods" "GET, POST, OPTIONS"
-      |>.header! "Access-Control-Allow-Headers" "Content-Type"
       |>.body ("<!DOCTYPE html>\n" ++ htmlContent.asString)
 
   | (.get, "/json") => do
@@ -660,6 +714,11 @@ def main : IO Unit := Async.block do
   let assets := HashMap.emptyWithCapacity
   let assets := assets.insert "loogle.png" (← IO.FS.readBinFile "./assets/loogle.png")
   let assets := assets.insert "loogle-banner.png" (← IO.FS.readBinFile "./assets/loogle-banner.png")
+  let assets := assets.insert "blurb.html" (← IO.FS.readBinFile "./blurb.html")
+
+  -- Get version information
+  let loogleRev ← Loogle.getGitRevision
+  let mathlibRev ← Loogle.getMathlibRevision
 
   -- Initialize application context
   let context ← Loogle.Context.mk
@@ -668,19 +727,20 @@ def main : IO Unit := Async.block do
     <*> Loogle.Database.start
 
   -- Set version information in metrics
-  context.metrics.setLabel "versions" "loogle" (← Loogle.getGitRevision)
-  context.metrics.setLabel "versions" "mathlib" (← Loogle.getMathlibRevision)
+  context.metrics.setLabel "versions" "loogle" loogleRev
+  context.metrics.setLabel "versions" "mathlib" mathlibRev
 
-  dbg_trace "[database] starting"
-  let start ← context.database.waitForReady
+  background do
+    dbg_trace "[database] starting"
+    let start ← context.database.waitForReady
 
-  if ¬start then
-    throw (.userError "cannot start database")
+    if ¬start then
+      throw (.userError "cannot start database")
 
-  dbg_trace "[database] started"
+    dbg_trace "[database] started"
 
   -- Start the HTTP server
-  let server ← Server.serve serverAddress (fun req => Loogle.handleRequest req context)
+  let server ← Server.serve serverAddress (fun req => Loogle.handleRequest req loogleRev mathlibRev context)
   IO.println "[server] ready!"
 
   let sigintWaiter ← Signal.Waiter.mk Signal.sigint true
@@ -692,7 +752,18 @@ def main : IO Unit := Async.block do
     ]
 
     if shouldCancel then
-      IO.println "[server] shutting down!"
-      server.shutdownAndWait
+      server.shutdown
+
+      IO.println "[server] shutting down, times out in 5s"
+
+      let timedout ← Selectable.one #[
+        .case server.waitShutdownSelector fun _ => pure false,
+        .case (← Selector.sleep 5000) fun _ => pure true
+      ]
+
+      if timedout then
+        IO.println "[server] forcing shutdown"
+        break
+
     else
       break
